@@ -73,9 +73,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        if scene.msd is None:
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        else:
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras()
+            viewpoint_cam = next(viewpoint_stack)
 
         # Render
         if (iteration - 1) == debug_from:
@@ -88,8 +93,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        if scene.msd is None:
+            Ll1 = l1_loss(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        else:
+            # corrupt image
+            ctf = scene.msd.readCTF(viewpoint_cam.colmap_id, viewpoint_cam.image_width)
+            image = torch.fft.ifft2(torch.fft.fft2(image) * ctf)
+            # add noise; the math is weird so i will just guess
+            image = image + torch.normal(128, 64, (viewpoint_cam.image_width, viewpoint_cam.image_height))
+            # compute loss
+            loss = l1_loss(image, gt_image)
         loss.backward()
 
         iter_end.record()

@@ -1,12 +1,29 @@
 # load + read cryoEM data
+import os
 import numpy as np
 import pandas as pd
 import struct
-
-from dataset_readers import CameraInfo
-from utils.graphics_utils import getWorld2View2, focal2fov
-
+from typing import NamedTuple
 from PIL import Image
+
+from dataset_readers import CameraInfo, SceneInfo, getNerfppNorm, storePly, fetchPly, sceneLoadTypeCallbacks
+from scene.gaussian_model import BasicPointCloud
+from utils.camera_utils import loadCam
+from utils.graphics_utils import focal2fov, fov2focal
+from utils.sh_utils import SH2RGB
+
+# custom data structures
+
+# camera info without the actual image
+class CameraInfoLight(NamedTuple):
+    uid: int
+    R: np.array
+    T: np.array
+    FovY: np.array
+    FovX: np.array
+    image_name: str
+    width: int
+    height: int
 
 # data for a single mrcs, star pair
 class MrcsStarData:
@@ -197,7 +214,7 @@ class MrcsStarData:
         return -w1 * np.sin(chi) - w2 * np.cos(chi)
     
     # get caminfo object for particle image
-    def readCamInfo(self, idx, focal=1e7):
+    def readCamInfo(self, idx, focal=1e7, light=False):
         # focal = arbitrarily large focal length to simulate orthographic projection without modifying renderer
 
         # euler angles to rot matrix; adapted from RELION, 3x3 (non-homogeneous) case
@@ -208,7 +225,6 @@ class MrcsStarData:
             tilt = tilt * d2r
             psi = psi * d2r
 
-            # this is probably normal but i'm just copying from relion without thinking tbh
             ca = np.cos(rot)
             cb = np.cos(tilt)
             cg = np.cos(psi)
@@ -260,8 +276,78 @@ class MrcsStarData:
         T[1] = shifty
         T[2] = focal # focal / z ~= 1
 
-        # assemble into CameraInfo object
+        # assemble into CameraInfo or CameraInfoLight object
         w = self.nxyz[0]
         h = self.nxyz[1]
-        return CameraInfo(uid=idx, R=R, T=T, FovX=focal2fov(focal, w), FovY=focal2fov(focal, h), 
-                          image=self.readImage(idx), image_name=self.star_df.index[idx], image_path=self.mrcs_fn)
+        if light:
+            return CameraInfoLight(uid=idx, R=R, T=T, FovX=focal2fov(focal, w), FovY=focal2fov(focal, h),
+                                   image_name=self.star_df.index[idx], width=w, height=h)
+        else:
+            return CameraInfo(uid=idx, R=R, T=T, FovX=focal2fov(focal, w), FovY=focal2fov(focal, h), 
+                              image=self.readImage(idx), image_name=self.star_df.index[idx], image_path=self.mrcs_fn,
+                              width=w, height=h)
+
+# functions
+
+# make camera generators from CameraInfoLight objects
+# lets us "reset" the generator any number of times
+class camGenMaker:
+    def __init__(self, cam_infos, resolution_scale, msd : MrcsStarData, args):
+        self.cam_infos = cam_infos
+        self.resolution_scale = resolution_scale
+        self.msd = msd
+        self.args = args
+
+    def makeCameraGen(self):
+        for id, c in enumerate(self.cam_infos):
+            cam_idx = c.uid
+            caminfo = self.msd.readCamInfo(cam_idx, light=False)
+            cam = loadCam(self.args, id, caminfo, self.resolution_scale)
+            # set maybe possibly reasonable values for zfar and znear
+            cam.zfar = fov2focal(caminfo.FoVx) + caminfo.width * 2
+            cam.znear = fov2focal(caminfo.FoVx) - caminfo.width * 2
+            yield cam
+
+# modified from readNerfSyntheticInfo
+def readCEMSceneInfo(msd : MrcsStarData, eval=False):
+    print("Reading poses")
+
+    train_cam_infos = []
+    test_cam_infos = []
+    for i in range(len(msd)):
+        train_cam_infos.append(msd.readCamInfo(i, light=True))
+    
+    # TODO: implement eval split
+
+    # use light camera info for nerf_normalization
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    # assume we can store the ply in the same place as the mrcs dataset
+    path = os.path.dirname(msd.mrcs_fn)
+
+    ply_path = os.path.join(path, "points3d.ply")
+    if not os.path.exists(ply_path):
+        # Since this data set has no colmap data, we start with random points
+        num_pts = 100_000
+        print(f"Generating random point cloud ({num_pts})...")
+        
+        # set world coordinate bounds based on camera coordinates; no magnification
+        xyz = np.random.random((num_pts, 3)) * (msd.nxyz[0] * 2) - msd.nxyz[0]
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
+# add to callbacks
+sceneLoadTypeCallbacks['CEM'] = readCEMSceneInfo

@@ -13,10 +13,12 @@ import os
 import random
 import json
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks
+#from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+
+from scene.cem_loader_reader import MrcsStarData, camGenMaker, sceneLoadTypeCallbacks
 
 class Scene:
 
@@ -40,7 +42,12 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        # check for CEM data
+        self.msd = None
+        if args.pose_path is not "":
+            self.msd = MrcsStarData(args.source_path, args.pose_path)
+            scene_info = sceneLoadTypeCallbacks['CEM'](self.msd)
+        elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
@@ -69,10 +76,17 @@ class Scene:
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
         for resolution_scale in resolution_scales:
-            print("Loading Training Cameras")
-            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
-            print("Loading Test Cameras")
-            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
+            if self.msd is None:
+                print("Loading Training Cameras")
+                self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
+                print("Loading Test Cameras")
+                self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
+            else:
+                # use generators to avoid loading entire dataset for CEM
+                print("Loading Training Cameras")
+                self.train_cameras[resolution_scale] = camGenMaker(scene_info.train_cameras, resolution_scale, self.msd, args)
+                print("Loading Test Cameras")
+                self.test_cameras[resolution_scale] = camGenMaker(scene_info.test_cameras, resolution_scale, self.msd, args)
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
@@ -87,7 +101,13 @@ class Scene:
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
 
     def getTrainCameras(self, scale=1.0):
-        return self.train_cameras[scale]
+        if self.msd is None:
+            return self.train_cameras[scale]
+        else:
+            return self.train_cameras[scale].makeCameraGen()
 
     def getTestCameras(self, scale=1.0):
-        return self.test_cameras[scale]
+        if self.msd is None:
+            return self.test_cameras[scale]
+        else:
+            return self.test_cameras[scale].makeCameraGen()
